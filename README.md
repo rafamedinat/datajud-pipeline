@@ -22,7 +22,7 @@ flowchart LR
 |---|---|
 | **raw** | Respostas da API sem transformação, em JSONL, particionadas por `tribunal=`, `extracted_at=` e `run=` (uma pasta por execução) |
 | **silver** | Processos tipados e deduplicados (versão mais recente de cada processo), movimentos e assuntos explodidos |
-| **gold** | `processos_features` (base de modelagem, com o alvo `duracao_dias` + `encerrado` no formato de sobrevivência) e `kpis_classe` |
+| **gold** | `processos_features` (base de modelagem, com o alvo `duracao_dias` + `encerrado` no formato de sobrevivência, e a variante `_de_fato`) e `kpis_classe` |
 
 ## Decisões de projeto
 
@@ -46,6 +46,12 @@ flowchart LR
   o fim é Baixa Definitiva (22) ou Arquivamento Definitivo (246), e a reabertura é Reativação (849) ou
   Desarquivamento (893). O processo só conta como encerrado se o último evento de fim não foi seguido
   de reabertura, e a data é a desse último evento.
+- **Encerramento de fato, ao lado do formal.** 21% dos processos da amostra passam por arquivamento
+  provisório (245), e a maioria nunca recebe baixa formal: só 34% voltam a ter movimento relevante, e
+  90% das retomadas acontecem em até ~3 anos. Por isso a gold também traz `encerrado_de_fato` e
+  `duracao_dias_de_fato`, em que um arquivamento provisório seguido de 3 anos ou mais sem movimento
+  relevante conta como encerramento na data do arquivamento. É uma inferência a partir dos dados, não
+  uma regra do CNJ; as duas definições ficam lado a lado para comparar os modelos.
 - **Alvo de sobrevivência, com censura na data certa.** Processos não encerrados entram como
   censurados na *data de corte* — a última atualização do processo na API —, não na data de hoje: a
   base pública não é atualizada diariamente, e usar hoje inventaria tempo não observado.

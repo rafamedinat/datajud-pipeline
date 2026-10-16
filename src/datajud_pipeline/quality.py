@@ -63,6 +63,20 @@ CHECKS = [
            WHERE data_encerramento > data_corte""",
     ),
     Check(
+        "encerrado formal também é encerrado de fato, na mesma data",
+        "erro",
+        """SELECT count(*) FROM gold.processos_features
+           WHERE encerrado AND (NOT encerrado_de_fato
+                 OR data_encerramento_de_fato <> data_encerramento)""",
+    ),
+    Check(
+        "duração de fato preenchida, não negativa e até a duração formal",
+        "erro",
+        """SELECT count(*) FROM gold.processos_features
+           WHERE duracao_dias_de_fato IS NULL OR duracao_dias_de_fato < 0
+              OR duracao_dias_de_fato > duracao_dias""",
+    ),
+    Check(
         "nenhum processo sigiloso na base de modelagem",
         "erro",
         """SELECT count(*) FROM gold.processos_features f

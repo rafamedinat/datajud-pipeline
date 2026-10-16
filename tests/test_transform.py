@@ -106,6 +106,35 @@ def test_reabertura_desfaz_encerramento(tmp_path):
     assert rows["3"] == (True, 365)
 
 
+def test_encerramento_de_fato_por_arquivamento_provisorio(tmp_path):
+    # data de corte de todos: 2024-01-01 (dataHoraUltimaAtualizacao do _processo)
+    settings = Settings(data_dir=tmp_path)
+    page = [
+        # arquivado provisoriamente há 5 anos, só rotina de cartório depois: encerrado de fato
+        _processo("1", [(245, "2019-01-01"), (85, "2020-06-01"), (60, "2021-01-01")]),
+        # arquivado provisoriamente e reativado: continua em andamento
+        _processo("2", [(245, "2019-01-01"), (849, "2020-01-01")]),
+        # arquivado provisoriamente há menos de 3 anos: ainda pode voltar
+        _processo("3", [(245, "2022-01-01")]),
+        # baixa formal: encerrado nas duas definições, na mesma data
+        _processo("4", [(245, "2018-06-01"), (22, "2019-01-01")]),
+    ]
+    write_raw_page(page, settings.raw_dir / "tribunal=tjsp" / "extracted_at=2026-10-15", 1)
+    transform(settings)
+    with duckdb.connect(str(settings.warehouse_path), read_only=True) as con:
+        rows = {
+            r[0]: r[1:]
+            for r in con.execute(
+                "SELECT numero_processo, encerrado, encerrado_de_fato, duracao_dias_de_fato "
+                "FROM gold.processos_features"
+            ).fetchall()
+        }
+    assert rows["1"] == (False, True, 365)
+    assert rows["2"] == (False, False, 2191)  # censurado na data de corte
+    assert rows["3"] == (False, False, 2191)
+    assert rows["4"] == (True, True, 365)
+
+
 def test_checagem_de_erro_interrompe_o_pipeline(monkeypatch):
     from datajud_pipeline import quality
 
