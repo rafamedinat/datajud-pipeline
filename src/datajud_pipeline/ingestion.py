@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,27 +38,62 @@ class TransientError(RuntimeError):
 STATE_FILE = "_state.json"
 
 
+@dataclass(frozen=True)
+class Recorte:
+    """Filtros de uma ingestão. Com `seed`, os processos vêm numa ordem aleatória
+    reprodutível, e `max_docs` vira uma amostra aleatória simples do recorte."""
+
+    classe: int | None = None
+    grau: str | None = None
+    ajuizado_desde: str | None = None
+    ajuizado_ate: str | None = None  # exclusivo
+    seed: int | None = None
+
+
 def build_query(
     page_size: int,
-    classe: int | None = None,
-    ajuizado_desde: str | None = None,
+    recorte: Recorte | None = None,
     search_after: list[Any] | None = None,
 ) -> dict[str, Any]:
-    """Monta a query DSL de uma página."""
-    filters: list[dict[str, Any]] = []
-    if classe is not None:
-        filters.append({"match": {"classe.codigo": classe}})
-    if ajuizado_desde:
-        filters.append({"range": {"dataAjuizamento": {"gte": ajuizado_desde}}})
+    """Monta a query DSL de uma página.
 
-    query: dict[str, Any] = {
-        "size": page_size,
-        "query": {"bool": {"filter": filters}} if filters else {"match_all": {}},
-        "sort": [{"@timestamp": {"order": "asc"}}],
-    }
+    A ordenação sempre termina em `id.keyword` (único por processo e grau) para desempatar:
+    só com `@timestamp`, documentos com o mesmo valor na virada da página seriam pulados
+    pelo `search_after`.
+    """
+    recorte = recorte or Recorte()
+    filters: list[dict[str, Any]] = []
+    if recorte.classe is not None:
+        filters.append({"match": {"classe.codigo": recorte.classe}})
+    if recorte.grau:
+        filters.append({"match": {"grau": recorte.grau}})
+    datas = {}
+    if recorte.ajuizado_desde:
+        datas["gte"] = recorte.ajuizado_desde
+    if recorte.ajuizado_ate:
+        datas["lt"] = recorte.ajuizado_ate
+    if datas:
+        filters.append({"range": {"dataAjuizamento": datas}})
+
+    base: dict[str, Any] = {"bool": {"filter": filters}} if filters else {"match_all": {}}
+    if recorte.seed is None:
+        query = base
+        sort: list[dict[str, Any]] = [{"@timestamp": {"order": "asc"}}]
+    else:
+        query = {
+            "function_score": {
+                "query": base,
+                "random_score": {"seed": recorte.seed, "field": "id.keyword"},
+                "boost_mode": "replace",
+            }
+        }
+        sort = [{"_score": {"order": "desc"}}]
+    sort.append({"id.keyword": {"order": "asc"}})
+
+    body: dict[str, Any] = {"size": page_size, "query": query, "sort": sort}
     if search_after is not None:
-        query["search_after"] = search_after
-    return query
+        body["search_after"] = search_after
+    return body
 
 
 class DataJudClient:
@@ -92,8 +128,7 @@ class DataJudClient:
     def iter_pages(
         self,
         tribunal: str,
-        classe: int | None = None,
-        ajuizado_desde: str | None = None,
+        recorte: Recorte | None = None,
         max_docs: int | None = None,
         search_after: list[Any] | None = None,
         total: int = 0,
@@ -106,12 +141,12 @@ class DataJudClient:
 
         while True:
             size = self.settings.page_size
-            if max_docs is not None:
+            if max_docs:  # None ou 0 = sem limite
                 size = min(size, max_docs - total)
                 if size <= 0:
                     return
 
-            body = build_query(size, classe, ajuizado_desde, search_after)
+            body = build_query(size, recorte, search_after)
             data = self._post(url, body)
             hits = data.get("hits", {}).get("hits", [])
             if not hits:
@@ -155,8 +190,7 @@ def find_incomplete_run(raw_dir: Path, tribunal: str) -> Path | None:
 
 def ingest(
     tribunal: str,
-    classe: int | None = None,
-    ajuizado_desde: str | None = None,
+    recorte: Recorte | None = None,
     max_docs: int | None = None,
     settings: Settings | None = None,
     client: DataJudClient | None = None,
@@ -164,8 +198,8 @@ def ingest(
 ) -> int:
     """Executa a ingestão e devolve o total de documentos gravados nesta execução.
 
-    Com `resume=True`, continua a execução incompleta mais recente do tribunal com os
-    mesmos filtros dela, a partir da última página gravada.
+    Com `resume=True`, continua a execução incompleta mais recente do tribunal com o
+    mesmo recorte dela, a partir da última página gravada.
     """
     settings = settings or Settings()
     client = client or DataJudClient(settings)
@@ -176,10 +210,8 @@ def ingest(
             raise DataJudError(f"Nenhuma ingestão incompleta de {tribunal} para retomar.")
         state = json.loads((run_dir / STATE_FILE).read_text(encoding="utf-8"))
         log.info(
-            "Retomando %s: %d docs em %d páginas já gravados (classe=%s, ajuizado_desde=%s, "
-            "max_docs=%s)",
-            run_dir, state["total"], state["pages"], state["classe"],
-            state["ajuizado_desde"], state["max_docs"],
+            "Retomando %s: %d docs em %d páginas já gravados (recorte=%s, max_docs=%s)",
+            run_dir, state["total"], state["pages"], state["recorte"], state["max_docs"],
         )
     else:
         now = datetime.now(timezone.utc)
@@ -192,8 +224,7 @@ def ingest(
         run_dir.mkdir(parents=True, exist_ok=True)
         state = {
             "tribunal": tribunal.lower(),
-            "classe": classe,
-            "ajuizado_desde": ajuizado_desde,
+            "recorte": asdict(recorte or Recorte()),
             "max_docs": max_docs,
             "search_after": None,
             "pages": 0,
@@ -205,8 +236,7 @@ def ingest(
     already = state["total"]
     pages = client.iter_pages(
         state["tribunal"],
-        state["classe"],
-        state["ajuizado_desde"],
+        Recorte(**state["recorte"]),
         state["max_docs"],
         search_after=state["search_after"],
         total=state["total"],

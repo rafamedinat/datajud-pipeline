@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from datajud_pipeline.config import Settings, endpoint
-from datajud_pipeline.ingestion import DataJudError, build_query, ingest
+from datajud_pipeline.ingestion import DataJudError, Recorte, build_query, ingest
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "sample_hits.json").read_text("utf-8"))
 
@@ -39,12 +39,23 @@ def test_endpoint_usa_sigla_minuscula():
 
 
 def test_build_query_com_filtros_e_paginacao():
-    q = build_query(100, classe=7, ajuizado_desde="2020-01-01", search_after=[123])
+    recorte = Recorte(classe=7, grau="G1", ajuizado_desde="2015-01-01", ajuizado_ate="2020-01-01")
+    q = build_query(100, recorte, search_after=[123, "TJSP_G1_1"])
     filtros = q["query"]["bool"]["filter"]
     assert {"match": {"classe.codigo": 7}} in filtros
-    assert {"range": {"dataAjuizamento": {"gte": "2020-01-01"}}} in filtros
-    assert q["search_after"] == [123]
-    assert q["sort"] == [{"@timestamp": {"order": "asc"}}]
+    assert {"match": {"grau": "G1"}} in filtros
+    assert {"range": {"dataAjuizamento": {"gte": "2015-01-01", "lt": "2020-01-01"}}} in filtros
+    assert q["search_after"] == [123, "TJSP_G1_1"]
+    # o id desempata documentos com o mesmo @timestamp na virada da página
+    assert q["sort"] == [{"@timestamp": {"order": "asc"}}, {"id.keyword": {"order": "asc"}}]
+
+
+def test_build_query_amostra_aleatoria_reprodutivel():
+    q = build_query(100, Recorte(classe=7, seed=42))
+    fs = q["query"]["function_score"]
+    assert fs["random_score"] == {"seed": 42, "field": "id.keyword"}
+    assert fs["query"]["bool"]["filter"] == [{"match": {"classe.codigo": 7}}]
+    assert q["sort"] == [{"_score": {"order": "desc"}}, {"id.keyword": {"order": "asc"}}]
 
 
 def test_build_query_sem_filtros():
@@ -66,6 +77,14 @@ def test_ingest_pagina_e_grava_jsonl(tmp_path):
     # a segunda página continua do `sort` do último hit da primeira
     assert session.bodies[1]["search_after"] == FIXTURE[1]["sort"]
     assert session.headers["Authorization"].startswith("APIKey ")
+
+
+def test_max_docs_zero_e_sem_limite(tmp_path):
+    from datajud_pipeline.ingestion import DataJudClient
+
+    settings = Settings(data_dir=tmp_path, page_size=2)
+    session = FakeSession([FIXTURE[:2], FIXTURE[2:]])
+    assert ingest("tjsp", max_docs=0, settings=settings, client=DataJudClient(settings, session)) == 4
 
 
 def test_ingest_respeita_max_docs(tmp_path):
@@ -135,7 +154,7 @@ def test_resume_continua_do_ultimo_cursor(tmp_path):
     settings = Settings(data_dir=tmp_path, page_size=2)
     falha = FailingSession([FIXTURE[:2]])
     with pytest.raises(DataJudError):
-        ingest("tjsp", classe=7, settings=settings, client=DataJudClient(settings, falha))
+        ingest("tjsp", Recorte(classe=7), settings=settings, client=DataJudClient(settings, falha))
 
     run_dir = find_incomplete_run(settings.raw_dir, "tjsp")
     assert run_dir is not None
