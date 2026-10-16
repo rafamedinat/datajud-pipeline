@@ -20,7 +20,7 @@ flowchart LR
 
 | Camada | Conteúdo |
 |---|---|
-| **raw** | Respostas da API sem transformação, em JSONL, particionadas por `tribunal=` e `extracted_at=` |
+| **raw** | Respostas da API sem transformação, em JSONL, particionadas por `tribunal=`, `extracted_at=` e `run=` (uma pasta por execução) |
 | **silver** | Processos tipados e deduplicados (versão mais recente de cada processo), movimentos e assuntos explodidos |
 | **gold** | `processos_features` (base de modelagem, com a variável-alvo `dias_ate_encerramento`) e `kpis_classe` |
 
@@ -32,6 +32,8 @@ flowchart LR
   resultados, então a paginação usa o `sort` do último documento.
 - **Retries só para erros transitórios** (timeout, 429, 5xx), com backoff exponencial. Erros 4xx falham
   na hora.
+- **Ingestão retomável.** Cada execução grava numa pasta própria e salva o cursor (`search_after`) em
+  `_state.json` depois de cada página; `--resume` continua uma ingestão interrompida sem rebaixar nada.
 - **Sem vazamento de dados.** As features usam só atributos conhecidos no ajuizamento (classe,
   assunto, órgão, município, data). O encerramento é o primeiro movimento de baixa ou arquivamento
   definitivo na [TPU do CNJ](https://www.cnj.jus.br/sgt/consulta_publica_movimentos.php)
@@ -53,6 +55,12 @@ Filtrar por classe processual e data de ajuizamento:
 
 ```bash
 datajud ingest --tribunal tjsp --classe 7 --ajuizado-desde 2018-01-01 --max-docs 20000
+```
+
+Se a ingestão for interrompida (timeout, queda de rede), continue de onde parou com os mesmos filtros:
+
+```bash
+datajud ingest --tribunal tjsp --resume
 ```
 
 Consultar o resultado:

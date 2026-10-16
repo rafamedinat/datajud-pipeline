@@ -3,6 +3,10 @@
 A API é um Elasticsearch: a busca é feita por POST com uma query DSL e a paginação
 profunda usa `sort` + `search_after`. Cada página é gravada como um arquivo JSONL na
 camada raw, particionada por tribunal e data de extração, sem nenhuma transformação.
+
+Cada execução grava num diretório próprio (`run=`), então execuções no mesmo dia não se
+sobrescrevem. Depois de cada página o cursor é salvo em `_state.json`, o que permite
+retomar uma ingestão interrompida com `resume=True`.
 """
 
 from __future__ import annotations
@@ -28,6 +32,9 @@ class DataJudError(RuntimeError):
 
 class TransientError(RuntimeError):
     """Erro temporário (timeout, 429, 5xx): vale tentar de novo."""
+
+
+STATE_FILE = "_state.json"
 
 
 def build_query(
@@ -88,11 +95,14 @@ class DataJudClient:
         classe: int | None = None,
         ajuizado_desde: str | None = None,
         max_docs: int | None = None,
+        search_after: list[Any] | None = None,
+        total: int = 0,
     ) -> Iterator[list[dict[str, Any]]]:
-        """Itera páginas de `hits` até acabar os resultados ou atingir `max_docs`."""
+        """Itera páginas de `hits` até acabar os resultados ou atingir `max_docs`.
+
+        `search_after` e `total` permitem continuar de onde uma execução anterior parou.
+        """
         url = endpoint(tribunal)
-        search_after: list[Any] | None = None
-        total = 0
 
         while True:
             size = self.settings.page_size
@@ -126,6 +136,23 @@ def write_raw_page(hits: list[dict[str, Any]], out_dir: Path, page_number: int) 
     return path
 
 
+def _write_state(run_dir: Path, state: dict[str, Any]) -> None:
+    """Grava o estado da execução de forma atômica (arquivo temporário + rename)."""
+    tmp = run_dir / f"{STATE_FILE}.tmp"
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(run_dir / STATE_FILE)
+
+
+def find_incomplete_run(raw_dir: Path, tribunal: str) -> Path | None:
+    """Diretório da execução incompleta mais recente do tribunal, se houver."""
+    base = raw_dir / f"tribunal={tribunal.lower()}"
+    runs = sorted(base.glob(f"extracted_at=*/run=*/{STATE_FILE}"), key=lambda p: p.parent.name)
+    for state_path in reversed(runs):
+        if not json.loads(state_path.read_text(encoding="utf-8")).get("complete"):
+            return state_path.parent
+    return None
+
+
 def ingest(
     tribunal: str,
     classe: int | None = None,
@@ -133,17 +160,65 @@ def ingest(
     max_docs: int | None = None,
     settings: Settings | None = None,
     client: DataJudClient | None = None,
+    resume: bool = False,
 ) -> int:
-    """Executa a ingestão e devolve o total de documentos gravados."""
+    """Executa a ingestão e devolve o total de documentos gravados nesta execução.
+
+    Com `resume=True`, continua a execução incompleta mais recente do tribunal com os
+    mesmos filtros dela, a partir da última página gravada.
+    """
     settings = settings or Settings()
     client = client or DataJudClient(settings)
-    extracted_at = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    out_dir = settings.raw_dir / f"tribunal={tribunal.lower()}" / f"extracted_at={extracted_at}"
 
-    total = 0
-    for i, hits in enumerate(client.iter_pages(tribunal, classe, ajuizado_desde, max_docs), 1):
-        write_raw_page(hits, out_dir, i)
-        total += len(hits)
+    if resume:
+        run_dir = find_incomplete_run(settings.raw_dir, tribunal)
+        if run_dir is None:
+            raise DataJudError(f"Nenhuma ingestão incompleta de {tribunal} para retomar.")
+        state = json.loads((run_dir / STATE_FILE).read_text(encoding="utf-8"))
+        log.info(
+            "Retomando %s: %d docs em %d páginas já gravados (classe=%s, ajuizado_desde=%s, "
+            "max_docs=%s)",
+            run_dir, state["total"], state["pages"], state["classe"],
+            state["ajuizado_desde"], state["max_docs"],
+        )
+    else:
+        now = datetime.now(timezone.utc)
+        run_dir = (
+            settings.raw_dir
+            / f"tribunal={tribunal.lower()}"
+            / f"extracted_at={now:%Y-%m-%d}"
+            / f"run={now:%Y%m%dT%H%M%SZ}"
+        )
+        run_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "tribunal": tribunal.lower(),
+            "classe": classe,
+            "ajuizado_desde": ajuizado_desde,
+            "max_docs": max_docs,
+            "search_after": None,
+            "pages": 0,
+            "total": 0,
+            "complete": False,
+        }
+        _write_state(run_dir, state)
 
-    log.info("Ingestão concluída: %d documentos em %s", total, out_dir)
-    return total
+    already = state["total"]
+    pages = client.iter_pages(
+        state["tribunal"],
+        state["classe"],
+        state["ajuizado_desde"],
+        state["max_docs"],
+        search_after=state["search_after"],
+        total=state["total"],
+    )
+    for hits in pages:
+        write_raw_page(hits, run_dir, state["pages"] + 1)
+        state["pages"] += 1
+        state["total"] += len(hits)
+        state["search_after"] = hits[-1].get("sort")
+        _write_state(run_dir, state)
+
+    state["complete"] = True
+    _write_state(run_dir, state)
+    log.info("Ingestão concluída: %d documentos em %s", state["total"], run_dir)
+    return state["total"] - already

@@ -1,0 +1,2 @@
+[console_scripts]
+datajud = datajud_pipeline.cli:main

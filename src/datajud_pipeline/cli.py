@@ -19,12 +19,19 @@ def main(argv: list[str] | None = None) -> None:
     p_ing.add_argument("--classe", type=int, help="código da classe processual (TPU)")
     p_ing.add_argument("--ajuizado-desde", help="data mínima de ajuizamento, ex.: 2020-01-01")
     p_ing.add_argument("--max-docs", type=int, default=5000, help="limite de documentos")
+    p_ing.add_argument(
+        "--resume",
+        action="store_true",
+        help="continua a última ingestão incompleta do tribunal, com os filtros dela",
+    )
 
     sub.add_parser("transform", help="gera as camadas silver e gold no DuckDB")
 
     args = parser.parse_args(argv)
     if args.cmd == "ingest":
-        ingest(args.tribunal, args.classe, args.ajuizado_desde, args.max_docs)
+        ingest(
+            args.tribunal, args.classe, args.ajuizado_desde, args.max_docs, resume=args.resume
+        )
     elif args.cmd == "transform":
         transform()
 
